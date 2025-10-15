@@ -42,6 +42,12 @@ with st.sidebar:
     st.code("streamlit run streamlit_gemini_audio_analyzer.py")
     st.markdown("---")
     st.info("Keep your GOOGLE_API_KEY secret. This app uploads audio to Gemini — usage may incur costs.")
+    st.markdown(
+        """
+        The Gemini file upload now requires a RAG store name. Set the environment variable `GOOGLE_RAG_STORE_NAME`
+        (or `RAG_STORE_NAME`) to the name of the RAG store you want to upload files to.
+        """
+    )
 
 # Helper functions
 
@@ -53,16 +59,22 @@ def configure_gemini_api():
     genai.configure(api_key=api_key)
 
 
-def upload_file_with_retries(path, max_retries=3, initial_delay=5):
-    """Uploads a file with retry mechanism."""
+def upload_file_with_retries(path, max_retries=3, initial_delay=5, rag_store_name=None):
+    """Uploads a file with retry mechanism. rag_store_name is required for Gemini uploads that target a RAG store."""
+    if not rag_store_name:
+        # Fail early with a clear message if the required parameter isn't provided
+        raise ValueError('Missing required RAG store name. Set the environment variable GOOGLE_RAG_STORE_NAME or provide rag_store_name to upload_file_with_retries.')
+
     last_exc = None
     for attempt in range(max_retries):
         try:
-            file_ref = genai.upload_file(path=path)
+            # The server-side error message references "ragStoreName" — pass it in the upload call.
+            # Some SDK versions accept snake_case; passing the camelCase name to the underlying API often works.
+            file_ref = genai.upload_file(path=path, ragStoreName=rag_store_name)
             return file_ref
         except (exceptions.ServiceUnavailable, googleapiclient_errors.ResumableUploadError, googleapiclient_errors.HttpError) as e:
-            # Only retry on 503 Service Unavailable errors
-            if isinstance(e, googleapiclient_errors.HttpError) and e.resp.status != 503:
+            # Only retry on 503 Service Unavailable errors or transient upload errors
+            if isinstance(e, googleapiclient_errors.HttpError) and getattr(e, "resp", None) and getattr(e.resp, "status", None) != 503:
                 raise e  # Re-raise if it's not a 503 error
 
             last_exc = e
@@ -127,11 +139,17 @@ if uploaded is not None:
     if st.button("Analyze with Gemini") or st.session_state.analysis:
         configure_gemini_api()
 
+        # Resolve RAG store name from environment
+        rag_store_name = os.getenv("GOOGLE_RAG_STORE_NAME") or os.getenv("RAG_STORE_NAME")
+        if not rag_store_name:
+            st.error("Missing RAG store name. Set the environment variable GOOGLE_RAG_STORE_NAME (or RAG_STORE_NAME) to the name of your RAG store and redeploy.")
+            st.stop()
+
         # Perform analysis only if it hasn't been done yet
         if st.session_state.analysis is None:
             with st.spinner("Uploading and processing audio — this can take some time..."):
                 try:
-                    file_ref = upload_file_with_retries(tmp.name)
+                    file_ref = upload_file_with_retries(tmp.name, rag_store_name=rag_store_name)
                     st.session_state.file_ref = file_ref # Save file_ref for chat
                     file_ref = wait_for_processing(file_ref, poll_interval=5, timeout=600)
                 except Exception as e:
@@ -142,11 +160,11 @@ if uploaded is not None:
 
             # Prompt asking for structured JSON output
             prompt = f"""
-            You are an expert intelligence analyst. Analyze the provided audio file by focusing on vocal characteristics like tone, pitch, and prosody to infer emotional state and intent. Return a single JSON object with the following keys:
+            You are an expert intelligence analyst. Analyze the provided audio file by focusing on vocal characteristics like tone, pitch, and prosody to infer emotional state and intent. Return a sin[...]
 
             1.  "transcription": A full and accurate transcript of all spoken words.
-            2.  "sentiment_analysis": An object describing the overall sentiment based on the words spoken. It must contain "score" (float from -1.0 to 1.0), "label" ('Positive', 'Negative', 'Neutral'), and "justification".
-            3.  "emotion_analysis": An object describing the overall emotion detected from the speaker's tone and prosody. It must contain a "label" (e.g., 'Angry', 'Happy', 'Sad', 'Anxious', 'Neutral'), a "justification" explaining why based on vocal cues, and an "intensity" score (float from 0.0 to 1.0).
+            2.  "sentiment_analysis": An object describing the overall sentiment based on the words spoken. It must contain "score" (float from -1.0 to 1.0), "label" ('Positive', 'Negative', 'Neutral'[...]
+            3.  "emotion_analysis": An object describing the overall emotion detected from the speaker's tone and prosody. It must contain a "label" (e.g., 'Angry', 'Happy', 'Sad', 'Anxious', 'Neutral[...]
             4.  "segments": An array of objects, where each object represents a segment of speech and contains:
                 - "start_time": float, in seconds.
                 - "end_time": float, in seconds.
@@ -157,7 +175,7 @@ if uploaded is not None:
             6.  "scene_prediction": A string describing the most likely environment (e.g., 'Quiet office meeting', 'Busy cafe').
             7.  "topics": A list of main topics and keywords discussed.
             8.  "focus_summary": A brief paragraph summarizing the main focus and recommendations.
-            9.  "sound_events": An array of objects, each detecting a non-speech sound. Each object must contain "start_time" (float), "end_time" (float), and "event_description" (string, e.g., 'dog barking', 'siren wailing', 'door closing').
+            9.  "sound_events": An array of objects, each detecting a non-speech sound. Each object must contain "start_time" (float), "end_time" (float), and "event_description" (string, e.g., 'dog b[...]
             10. "confidence": A float from 0.0 to 1.0 indicating your overall confidence in the analysis.
 
             ONLY OUTPUT VALID JSON. Do not include any commentary or explanation outside the JSON.
@@ -273,11 +291,6 @@ else:
 
 
 
-
-
-
 # Footer
 st.markdown("---")
 st.caption("Built with Streamlit + Google Gemini. Keep API keys safe.")
-
-
