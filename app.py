@@ -1,9 +1,9 @@
 import streamlit as st
 import os
-import sys
 import time
 import json
 import tempfile
+import inspect
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.api_core import exceptions
@@ -44,8 +44,11 @@ with st.sidebar:
     st.info("Keep your GOOGLE_API_KEY secret. This app uploads audio to Gemini — usage may incur costs.")
     st.markdown(
         """
-        The Gemini file upload now requires a RAG store name. Set the environment variable `GOOGLE_RAG_STORE_NAME`
-        (or `RAG_STORE_NAME`) to the name of the RAG store you want to upload files to.
+        If you intend to ingest files into a RAG/corpus store for retrieval-augmented workflows,
+        set the environment variable `GOOGLE_RAG_STORE_NAME` (or `RAG_STORE_NAME`). The app will try
+        to attach that name when the installed SDK supports it. If the installed SDK/version requires
+        a different ingestion flow (Vertex AI RAG APIs), follow Google Cloud's RAG samples instead:
+        https://cloud.google.com/vertex-ai/generative-ai/docs/samples/generativeaionvertexai-rag-upload-file
         """
     )
 
@@ -59,23 +62,64 @@ def configure_gemini_api():
     genai.configure(api_key=api_key)
 
 
-def upload_file_with_retries(path, max_retries=3, initial_delay=5, rag_store_name=None):
-    """Uploads a file with retry mechanism. rag_store_name is required for Gemini uploads that target a RAG store."""
-    if not rag_store_name:
-        # Fail early with a clear message if the required parameter isn't provided
-        raise ValueError('Missing required RAG store name. Set the environment variable GOOGLE_RAG_STORE_NAME or provide rag_store_name to upload_file_with_retries.')
+def _build_upload_kwargs(path, rag_store_name=None):
+    """
+    Build kwargs for genai.upload_file depending on the installed SDK's accepted parameters.
+    This avoids passing unexpected keyword arguments like 'ragStoreName' to older/newer SDKs.
+    """
+    sig = inspect.signature(genai.upload_file)
+    params = sig.parameters
 
+    kwargs = {}
+    # Always set path (most SDKs accept path)
+    if 'path' in params:
+        kwargs['path'] = path
+    elif 'file' in params:
+        # Some versions may call it 'file'
+        kwargs['file'] = path
+    else:
+        # As a safe fallback, pass first positional param name if it's not 'self'
+        first_param = next(iter(params.values()), None)
+        if first_param and first_param.name not in ('self', 'cls'):
+            kwargs[first_param.name] = path
+
+    # If the SDK supports any RAG/corpus-style parameter, set it
+    if rag_store_name:
+        if 'corpus_name' in params:
+            kwargs['corpus_name'] = rag_store_name
+        elif 'corpus' in params:
+            kwargs['corpus'] = rag_store_name
+        elif 'rag_store_name' in params:
+            kwargs['rag_store_name'] = rag_store_name
+        elif 'ragStoreName' in params:
+            kwargs['ragStoreName'] = rag_store_name
+        # else: installed genai.upload_file doesn't accept a RAG parameter; we will upload without it.
+
+    return kwargs
+
+
+def upload_file_with_retries(path, max_retries=3, initial_delay=5, rag_store_name=None):
+    """
+    Uploads a file with retry mechanism. This function is defensive:
+    - It inspects genai.upload_file signature at runtime and only passes kwargs that the local SDK accepts.
+    - If the server later rejects the upload because a RAG store was required, we surface a clear error with guidance.
+    """
     last_exc = None
     for attempt in range(max_retries):
         try:
-            # The server-side error message references "ragStoreName" — pass it in the upload call.
-            # Some SDK versions accept snake_case; passing the camelCase name to the underlying API often works.
-            file_ref = genai.upload_file(path=path, ragStoreName=rag_store_name)
+            kwargs = _build_upload_kwargs(path, rag_store_name=rag_store_name)
+            # Call upload without passing unexpected args
+            file_ref = genai.upload_file(**kwargs)
             return file_ref
         except (exceptions.ServiceUnavailable, googleapiclient_errors.ResumableUploadError, googleapiclient_errors.HttpError) as e:
-            # Only retry on 503 Service Unavailable errors or transient upload errors
-            if isinstance(e, googleapiclient_errors.HttpError) and getattr(e, "resp", None) and getattr(e.resp, "status", None) != 503:
-                raise e  # Re-raise if it's not a 503 error
+            # If the SDK/client raised because the server expects a rag store name, inspect the message
+            msg = str(e)
+            if isinstance(e, googleapiclient_errors.HttpError):
+                status = getattr(e, "resp", None) and getattr(e.resp, "status", None)
+                # If server rejected because of missing ragStoreName, raise helpful message after retries
+                if status and status != 503:
+                    # If it's a 4xx error, do not blindly retry
+                    raise e
 
             last_exc = e
             if attempt < max_retries - 1:
@@ -83,6 +127,17 @@ def upload_file_with_retries(path, max_retries=3, initial_delay=5, rag_store_nam
                 st.warning(f"Upload failed due to service availability. Retrying in {delay} seconds... (Attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
             else:
+                # Final attempt failed: if rag_store_name was provided but the server mentions 'ragStoreName',
+                # provide explicit guidance.
+                if rag_store_name and ("ragStoreName" in msg or "RAG" in msg or "corpus" in msg.lower()):
+                    raise RuntimeError(
+                        "Upload failed and the server response suggests the file must be attached to a RAG/corpus store. "
+                        "Your installed google-generativeai SDK does not accept a RAG parameter for genai.upload_file, "
+                        "or a different ingestion API is required. "
+                        "To ingest into a RAG store, you may need to use the Vertex AI RAG ingestion APIs (see: "
+                        "https://cloud.google.com/vertex-ai/generative-ai/docs/samples/generativeaionvertexai-rag-upload-file). "
+                        f"Original error: {e}"
+                    ) from e
                 raise e
     raise last_exc
 
@@ -91,7 +146,12 @@ def wait_for_processing(file_ref, poll_interval=5, timeout=300):
     """Waits for file processing to complete with a timeout."""
     start = time.time()
     while True:
-        file_ref = genai.get_file(file_ref.name)
+        # Safe attempt to refresh the file ref state
+        try:
+            file_ref = genai.get_file(getattr(file_ref, "name", file_ref))
+        except Exception:
+            # If get_file fails, break and return the last known ref (or raise)
+            raise
         state = getattr(file_ref.state, 'name', None)
         if state != "PROCESSING":
             return file_ref
@@ -102,7 +162,6 @@ def wait_for_processing(file_ref, poll_interval=5, timeout=300):
 
 def extract_json_from_text(text):
     """Extracts JSON from a string, handling potential errors."""
-    # Best-effort: try to load JSON directly, else try to find first/last braces
     try:
         return json.loads(text)
     except Exception:
@@ -139,19 +198,20 @@ if uploaded is not None:
     if st.button("Analyze with Gemini") or st.session_state.analysis:
         configure_gemini_api()
 
-        # Resolve RAG store name from environment
+        # Resolve RAG store name from environment (optional)
         rag_store_name = os.getenv("GOOGLE_RAG_STORE_NAME") or os.getenv("RAG_STORE_NAME")
-        if not rag_store_name:
-            st.error("Missing RAG store name. Set the environment variable GOOGLE_RAG_STORE_NAME (or RAG_STORE_NAME) to the name of your RAG store and redeploy.")
-            st.stop()
 
         # Perform analysis only if it hasn't been done yet
         if st.session_state.analysis is None:
             with st.spinner("Uploading and processing audio — this can take some time..."):
                 try:
                     file_ref = upload_file_with_retries(tmp.name, rag_store_name=rag_store_name)
-                    st.session_state.file_ref = file_ref # Save file_ref for chat
+                    st.session_state.file_ref = file_ref  # Save file_ref for chat
                     file_ref = wait_for_processing(file_ref, poll_interval=5, timeout=600)
+                except RuntimeError as rte:
+                    # Our helper produced a clear runtime error (e.g., telling user to use Vertex RAG API)
+                    st.error(f"File processing error: {rte}")
+                    st.stop()
                 except Exception as e:
                     st.error(f"File processing error: {e}")
                     st.stop()
@@ -160,11 +220,11 @@ if uploaded is not None:
 
             # Prompt asking for structured JSON output
             prompt = f"""
-            You are an expert intelligence analyst. Analyze the provided audio file by focusing on vocal characteristics like tone, pitch, and prosody to infer emotional state and intent. Return a sin[...]
+            You are an expert intelligence analyst. Analyze the provided audio file by focusing on vocal characteristics like tone, pitch, and prosody to infer emotional state and intent. Return a single JSON object with the following keys:
 
             1.  "transcription": A full and accurate transcript of all spoken words.
-            2.  "sentiment_analysis": An object describing the overall sentiment based on the words spoken. It must contain "score" (float from -1.0 to 1.0), "label" ('Positive', 'Negative', 'Neutral'[...]
-            3.  "emotion_analysis": An object describing the overall emotion detected from the speaker's tone and prosody. It must contain a "label" (e.g., 'Angry', 'Happy', 'Sad', 'Anxious', 'Neutral[...]
+            2.  "sentiment_analysis": An object describing the overall sentiment based on the words spoken. It must contain "score" (float from -1.0 to 1.0), "label" ('Positive', 'Negative', 'Neutral'), and "justification".
+            3.  "emotion_analysis": An object describing the overall emotion detected from the speaker's tone and prosody. It must contain a "label" and "intensity" (0.0-1.0), plus "justification".
             4.  "segments": An array of objects, where each object represents a segment of speech and contains:
                 - "start_time": float, in seconds.
                 - "end_time": float, in seconds.
@@ -175,12 +235,11 @@ if uploaded is not None:
             6.  "scene_prediction": A string describing the most likely environment (e.g., 'Quiet office meeting', 'Busy cafe').
             7.  "topics": A list of main topics and keywords discussed.
             8.  "focus_summary": A brief paragraph summarizing the main focus and recommendations.
-            9.  "sound_events": An array of objects, each detecting a non-speech sound. Each object must contain "start_time" (float), "end_time" (float), and "event_description" (string, e.g., 'dog b[...]
+            9.  "sound_events": An array of objects, each detecting a non-speech sound. Each object must contain "start_time", "end_time", and "event_description".
             10. "confidence": A float from 0.0 to 1.0 indicating your overall confidence in the analysis.
 
             ONLY OUTPUT VALID JSON. Do not include any commentary or explanation outside the JSON.
             """
-
 
             # Call Gemini model for initial analysis
             try:
@@ -190,7 +249,7 @@ if uploaded is not None:
                 )
                 with st.spinner("Generating analysis from Gemini (this can take up to a few minutes)..."):
                     response = model.generate_content([prompt, file_ref], request_options={"timeout": 1200})
-                
+
                 text = getattr(response, 'text', None) or str(response)
                 parsed = extract_json_from_text(text)
 
@@ -280,7 +339,7 @@ if uploaded is not None:
             # Send to Gemini and get response
             with st.spinner("Gemini is thinking..."):
                 response = st.session_state.chat.send_message(prompt)
-            
+
             # Add assistant response to UI and state
             with st.chat_message("assistant"):
                 st.markdown(response.text)
@@ -288,8 +347,6 @@ if uploaded is not None:
 
 else:
     st.info("Upload an audio file (mp3/wav/flac/m4a) to begin.")
-
-
 
 # Footer
 st.markdown("---")
