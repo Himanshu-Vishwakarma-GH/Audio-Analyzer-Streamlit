@@ -238,12 +238,14 @@ if uploaded is not None:
             Here is the complete JSON analysis of that audio file:
             {json.dumps(st.session_state.analysis, indent=2)}
             The user will now ask you questions about this audio file and its analysis.
-            Use the provided JSON and the original audio file to answer the user's questions accurately.
+            Use the provided JSON to answer accurately.
             """
+
             st.session_state.chat = chat_model.start_chat(history=[
-                {'role': 'user', 'parts': [initial_prompt]},
-                {'role': 'model', 'parts': ["Understood. I have the audio and its analysis. I'm ready to answer your questions."]}
+            {'role': 'user', 'parts': [initial_prompt]},
+            {'role': 'model', 'parts': ["Understood. I have the analysis and I'm ready to answer questions."]}
             ])
+
             st.session_state.messages.append({"role": "assistant", "content": "I've analyzed the audio. What would you like to know?"})
 
         # Display existing messages
@@ -277,4 +279,5 @@ else:
 # Footer
 st.markdown("---")
 st.caption("Built with Streamlit + Google Gemini. Keep API keys safe.")
+
 
