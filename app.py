@@ -241,7 +241,7 @@ if uploaded is not None:
             Use the provided JSON and the original audio file to answer the user's questions accurately.
             """
             st.session_state.chat = chat_model.start_chat(history=[
-                {'role': 'user', 'parts': [initial_prompt, st.session_state.file_ref]},
+                {'role': 'user', 'parts': [initial_prompt]},
                 {'role': 'model', 'parts': ["Understood. I have the audio and its analysis. I'm ready to answer your questions."]}
             ])
             st.session_state.messages.append({"role": "assistant", "content": "I've analyzed the audio. What would you like to know?"})
@@ -277,3 +277,4 @@ else:
 # Footer
 st.markdown("---")
 st.caption("Built with Streamlit + Google Gemini. Keep API keys safe.")
+
